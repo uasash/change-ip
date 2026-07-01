@@ -4,8 +4,10 @@ Shows the current public IP and lets you trigger a change via a configurable URL
 """
 
 import os
+import subprocess
 import threading
 import time
+import urllib.request
 
 import httpx
 from kivy.app import App
@@ -18,6 +20,58 @@ from kivy.uix.widget import Widget
 
 IP_CHECK_URL = os.environ.get("IP_CHECK_URL", "https://ifconfig.me/ip")
 CHANGE_IP_URL = os.environ.get("CHANGE_IP_URL", "")
+
+
+def get_system_proxy() -> str | None:
+    """Read the macOS system proxy settings.
+
+    Tries urllib.request.getproxies() first, then falls back to
+    ``scutil --proxy`` which reads directly from macOS system config.
+    """
+    # Try standard Python approach
+    proxies = urllib.request.getproxies()
+    proxy = proxies.get("https") or proxies.get("http")
+    if proxy:
+        return proxy
+
+    # Fallback: read from macOS system configuration via scutil
+    try:
+        result = subprocess.run(
+            ["scutil", "--proxy"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        lines = result.stdout.splitlines()
+        settings = {}
+        for line in lines:
+            if ": " in line:
+                key, _, value = line.partition(": ")
+                settings[key.strip()] = value.strip()
+
+        if settings.get("HTTPSEnable") == "1":
+            host = settings.get("HTTPSProxy", "")
+            port = settings.get("HTTPSPort", "")
+            if host:
+                return f"http://{host}:{port}" if port else f"http://{host}"
+
+        if settings.get("HTTPEnable") == "1":
+            host = settings.get("HTTPProxy", "")
+            port = settings.get("HTTPPort", "")
+            if host:
+                return f"http://{host}:{port}" if port else f"http://{host}"
+    except Exception:
+        pass
+
+    return None
+
+
+def make_client(**kwargs) -> httpx.Client:
+    """Create an httpx client that respects the system proxy."""
+    proxy = get_system_proxy()
+    if proxy:
+        kwargs["proxy"] = proxy
+    return httpx.Client(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +249,10 @@ class ChangeIPScreen(BoxLayout):
 
     def _fetch_ip(self):
         try:
-            resp = httpx.get(IP_CHECK_URL, timeout=10, follow_redirects=True)
-            resp.raise_for_status()
-            ip = resp.text.strip()
+            with make_client(timeout=10, follow_redirects=True) as client:
+                resp = client.get(IP_CHECK_URL)
+                resp.raise_for_status()
+                ip = resp.text.strip()
         except Exception as exc:
             ip = "—"
             msg = f"Error: {exc}"
@@ -241,8 +296,9 @@ class ChangeIPScreen(BoxLayout):
 
     def _do_change_ip(self):
         try:
-            resp = httpx.get(CHANGE_IP_URL, timeout=30, follow_redirects=True)
-            resp.raise_for_status()
+            with make_client(timeout=30, follow_redirects=True) as client:
+                resp = client.get(CHANGE_IP_URL)
+                resp.raise_for_status()
         except Exception as exc:
             msg = f"Change failed: {exc}"
             Clock.schedule_once(
